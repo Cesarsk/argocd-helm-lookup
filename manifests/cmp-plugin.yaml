@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cmp-plugin
+  namespace: argocd  # Adjust to match your ArgoCD namespace
+data:
+  plugin.yaml: |
+    apiVersion: argoproj.io/v1alpha1
+    kind: ConfigManagementPlugin
+    metadata:
+      name: helm-with-lookup
+    spec:
+      version: v1.0
+      discover:
+        find:
+          command: [sh, -c, "grep -q 'cmp-lookup.*enabled' Chart.yaml && echo found"]
+      init:
+        command: [sh, -c, "test -f Chart.lock && helm dependency build || true"]
+      generate:
+        command:
+          - sh
+          - -c
+          - |
+            CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+            export KUBECONFIG=/tmp/kube
+            cat > $KUBECONFIG << EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: $CA
+                server: https://kubernetes.default.svc
+              name: default
+            contexts:
+            - context: {cluster: default, namespace: $ARGOCD_APP_NAMESPACE, user: default}
+              name: default
+            current-context: default
+            users:
+            - name: default
+              user: {token: $TOKEN}
+            EOF
+            helm template $ARGOCD_APP_NAME . -n $ARGOCD_APP_NAMESPACE --dry-run=server --include-crds

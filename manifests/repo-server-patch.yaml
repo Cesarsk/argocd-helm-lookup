@@ -1,0 +1,41 @@
+# Strategic merge patch for the ArgoCD repo-server deployment.
+# Adds the CMP sidecar container that enables Helm lookup().
+#
+# Apply with:
+#   kubectl patch deployment argo-cd-argocd-repo-server -n argocd \
+#     --type strategic --patch-file manifests/repo-server-patch.yaml
+#
+# Or use: kubectl apply -f manifests/repo-server-patch.yaml
+#
+# NOTE: Adjust the metadata name/namespace to match your ArgoCD installation.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argo-cd-argocd-repo-server  # Adjust to match your deployment name
+  namespace: argocd                  # Adjust to match your ArgoCD namespace
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cmp-plugin
+          configMap:
+            name: cmp-plugin
+        - name: cmp-tmp
+          emptyDir: {}
+      containers:
+        - name: cmp-helm-lookup
+          command: [/var/run/argocd/argocd-cmp-server]
+          image: quay.io/argoproj/argocd:v2.12.1  # Match your ArgoCD version
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+          volumeMounts:
+            - name: cmp-plugin
+              mountPath: /home/argocd/cmp-server/config/plugin.yaml
+              subPath: plugin.yaml
+            - name: var-files
+              mountPath: /var/run/argocd
+            - name: cmp-tmp
+              mountPath: /tmp
+            - name: plugins
+              mountPath: /home/argocd/cmp-server/plugins

@@ -1,0 +1,17 @@
+# Example: cluster-wide metadata ConfigMap that any chart can read via lookup().
+# Deploy this to kube-system so it's accessible from any namespace.
+#
+# Charts can then read values without Helm overrides:
+#   {{- $meta := (lookup "v1" "ConfigMap" "kube-system" "aws-metadata") }}
+#   value: {{ $meta.data.region | quote }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aws-metadata
+  namespace: kube-system
+data:
+  accountId: "123456789012"
+  region: "eu-central-1"
+  vpcId: "vpc-0abc123def456"
+  clusterName: "my-cluster"
+  environment: "production"

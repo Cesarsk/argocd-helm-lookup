@@ -1,0 +1,26 @@
+# If you manage ArgoCD with Helm, add this to your values file
+# instead of using the strategic merge patch.
+repoServer:
+  volumes:
+    - name: cmp-plugin
+      configMap:
+        name: cmp-plugin
+    - name: cmp-tmp
+      emptyDir: {}
+  extraContainers:
+    - name: cmp-helm-lookup
+      command: [/var/run/argocd/argocd-cmp-server]
+      image: quay.io/argoproj/argocd:v2.12.1  # Match your ArgoCD version
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+      volumeMounts:
+        - name: cmp-plugin
+          mountPath: /home/argocd/cmp-server/config/plugin.yaml
+          subPath: plugin.yaml
+        - name: var-files
+          mountPath: /var/run/argocd
+        - name: cmp-tmp
+          mountPath: /tmp
+        - name: plugins
+          mountPath: /home/argocd/cmp-server/plugins
