@@ -1,10 +1,10 @@
 # ArgoCD CMP — Dynamic Value Injection
 
-A Config Management Plugin (CMP) that injects cluster-specific values into Helm charts at render time, removing the dependency on Terraform templating.
+A Config Management Plugin (CMP) that injects cluster-specific values into Helm charts at render time, removing the need to hardcode per-cluster values in chart configurations.
 
 ## Problem
 
-ArgoCD runs `helm template` offline. Cluster-specific values (account IDs, regions, VPC IDs) must be hardcoded via Terraform templating into ArgoCD configurations. Adding or updating a value requires Terraform plan/apply cycles across every cluster.
+ArgoCD runs `helm template` offline. Cluster-specific values (account IDs, regions, VPC IDs) must be hardcoded into ArgoCD configurations. Adding or updating a value requires propagating changes across every cluster individually.
 
 ## Solution
 
@@ -20,7 +20,7 @@ The mapping approach is recommended for all use cases. See [Approach Comparison]
 ## How the Mapping Approach Works
 
 ```
-cluster-metadata ConfigMap (kube-system, created by Terraform)
+cluster-metadata ConfigMap (kube-system, created during cluster provisioning)
          |
          '--- CMP generate.sh
               reads ConfigMap via K8s API
@@ -102,7 +102,7 @@ This repo contains two demo setups and a shared ConfigMap chart:
 
 **Path:** `cluster-metadata/`
 
-A Helm chart that deploys the `cluster-metadata` ConfigMap. In production, Terraform creates this during cluster provisioning. For the demo it's deployed as a standalone chart.
+A Helm chart that deploys the `cluster-metadata` ConfigMap. In production, this is created during cluster provisioning. For the demo it's deployed as a standalone chart.
 
 ```yaml
 data:
@@ -141,8 +141,8 @@ Example: scaling metrics-server from 3 to 5 replicas.
 
 **Single action: update the `cluster-metadata` ConfigMap.**
 
-1. **Update the Terraform variable** — change `replicas: "3"` to `replicas: "5"` in the cluster's tfvars
-2. **Terraform plan/apply** — updates the ConfigMap in the cluster
+1. **Update the variable** — change `replicas: "3"` to `replicas: "5"` in the cluster-metadata ConfigMap
+2. **Apply the change** — update the ConfigMap in the cluster
 3. **ArgoCD refreshes** — CMP re-reads the ConfigMap, generates `--set metrics-server.replicas=5`, detects OutOfSync
 4. **Deployment scales to 5** — ArgoCD applies the change
 
@@ -177,18 +177,6 @@ The CMP only participates in the **render** phase. It has no role in sync or app
 
 - **Refresh** — re-renders manifests via CMP (reads the live ConfigMap), compares against cluster state. This is all you need when a ConfigMap value changes.
 - **Hard Refresh** — same as above, but also re-fetches the Git repo and invalidates the Helm dependency cache. Only needed when the chart source in Git changed.
-
-### Timing dependency
-
-The CMP reads the **live ConfigMap in the cluster**, not Git. If the ConfigMap is managed by a separate ArgoCD Application (as in the demo), there's a timing dependency:
-
-1. Git push changes the `cluster-metadata` chart (e.g., `replicas: 3` -> `replicas: 5`)
-2. ArgoCD syncs the `cluster-metadata` app -> ConfigMap updated in the cluster
-3. ArgoCD refreshes the `metrics-server` app -> CMP reads the **updated** ConfigMap -> renders `replicas=5` -> detects OutOfSync
-
-If step 3 happens before step 2 (e.g., both apps refresh simultaneously), the CMP reads the **old** ConfigMap and sees no diff. The next refresh cycle (default: 3 minutes) will pick up the change.
-
-In production, where Terraform manages the ConfigMap directly (not via ArgoCD), this timing issue doesn't exist — the ConfigMap is updated before ArgoCD ever refreshes.
 
 ## Approach Comparison
 
@@ -246,16 +234,6 @@ Alternative: This is fragile — values are baked in at render time and don't ad
 
 **Recommendation: use the mapping approach for everything.** The `lookup()` capability exists as a side effect of how the CMP works (`--dry-run=server`) and is demonstrated in `approach-1-lookup-old/` for completeness, but is not the recommended pattern.
 
-## Security
-
-The generate script is hardened:
-
-- **No `eval`** — ConfigMap values parsed via `read`, never executed
-- **No `envsubst`** — prevents leaking system env vars
-- **Input validation** — rejects keys/values with shell metacharacters
-- **`--set-string`** — values treated as strings (numbers/booleans use `--set`)
-- **Read-only RBAC** — repo-server only has `get`/`list` permissions
-
 ## Files
 
 ```
@@ -264,7 +242,7 @@ cmp-installation/
   cmp-plugin.yaml                  # Plugin ConfigMap reference
   generate.sh                      # Generate script (source of truth)
   repo-server-patch.yaml           # Sidecar deployment patch
-cluster-metadata/                  # ConfigMap chart (Terraform equivalent for demo)
+cluster-metadata/                  # ConfigMap chart (for demo purposes)
 approach-1-lookup-old/             # lookup() demo (legacy)
   chart-with-cmp/                  #   CMP enabled — lookup() works
   chart-without-cmp/               #   No CMP — lookup() fails
