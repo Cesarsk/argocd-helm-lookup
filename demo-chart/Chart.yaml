@@ -1,8 +1,0 @@
-apiVersion: v2
-name: cmp-demo
-description: Demo chart that reads cluster metadata via Helm lookup()
-type: application
-version: 1.0.0
-appVersion: "1.0.0"
-annotations:
-  argocd.argoproj.io/cmp-lookup: "enabled"

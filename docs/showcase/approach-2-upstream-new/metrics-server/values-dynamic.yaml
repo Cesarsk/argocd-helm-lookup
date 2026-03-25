@@ -1,0 +1,11 @@
+# Maps cluster-metadata ConfigMap keys to metrics-server Helm value paths.
+# {key} placeholders are substituted with actual ConfigMap values.
+#
+# Available ConfigMap keys (from cluster-metadata):
+#   accountId, region, clusterName, vpcId, environment, replicas
+
+# IRSA role annotation on the ServiceAccount
+metrics-server.serviceAccount.annotations.eks\.amazonaws\.com/role-arn: "arn:aws:iam::{accountId}:role/metrics-server"
+
+# Replica count — varies per environment (e.g. 1 in dev, 2 in prod)
+metrics-server.replicas: "{replicas}"

@@ -1,3 +1,4 @@
+# RBAC for CMP - Grant repo-server read access for lookup()
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -16,8 +17,8 @@ metadata:
   name: argocd-repo-server-lookup
 subjects:
   - kind: ServiceAccount
-    name: argo-cd-argocd-repo-server  # Adjust to match your ArgoCD installation
-    namespace: argocd                  # Adjust to match your ArgoCD namespace
+    name: argocd-repo-server
+    namespace: argocd
 roleRef:
   kind: ClusterRole
   name: argocd-repo-server-lookup

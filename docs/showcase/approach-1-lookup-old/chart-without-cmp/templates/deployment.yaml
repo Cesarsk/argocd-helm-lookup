@@ -1,0 +1,27 @@
+{{- $aws := (lookup "v1" "ConfigMap" .Release.Namespace "aws-cluster-metadata") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Chart.Name }}
+    spec:
+      containers:
+      - name: app
+        image: nginx:alpine
+        env:
+        - name: AWS_ACCOUNT_ID
+          value: {{ $aws.data.accountId | quote }}
+        - name: AWS_REGION
+          value: {{ $aws.data.region | quote }}
+        - name: AWS_VPC_ID
+          value: {{ $aws.data.vpcId | quote }}
+        - name: CLUSTER_NAME
+          value: {{ $aws.data.clusterName | quote }}

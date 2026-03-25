@@ -1,0 +1,6 @@
+apiVersion: v2
+name: aws-metadata-demo
+description: Demo chart using lookup() - WITH CMP enabled
+version: 0.1.0
+annotations:
+  argocd.argoproj.io/cmp-lookup: "enabled"

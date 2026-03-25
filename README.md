@@ -1,456 +1,291 @@
-# ArgoCD Helm Lookup
+# ArgoCD CMP — Dynamic Value Injection
 
-Enable Helm's `lookup()` function in ArgoCD using a Config Management Plugin (CMP) sidecar.
+A Config Management Plugin (CMP) that injects cluster-specific values into Helm charts at render time, removing the dependency on Terraform templating.
 
-## The Problem
+## Problem
 
-Helm's [`lookup()`](https://helm.sh/docs/chart_template_guide/functions_and_pipelines/#using-the-lookup-function) function queries the Kubernetes API at render time to read existing resources. This is useful for:
+ArgoCD runs `helm template` offline. Cluster-specific values (account IDs, regions, VPC IDs) must be hardcoded via Terraform templating into ArgoCD configurations. Adding or updating a value requires Terraform plan/apply cycles and ~60 MRs.
 
-- Reading cluster metadata (account IDs, regions, VPC IDs) from a ConfigMap
-- Checking if a CRD exists before creating a resource
-- Dynamically configuring charts based on existing cluster state
+## Solution
 
-**However, ArgoCD renders Helm charts offline** using `helm template` (without `--dry-run=server`). This means `lookup()` always returns an empty dict `{}`, making it useless.
+A CMP sidecar on the ArgoCD repo-server that reads a `cluster-metadata` ConfigMap and injects values into any Helm chart via a `values-dynamic.yaml` mapping file.
 
+```
+cluster-metadata ConfigMap (kube-system, created by Terraform)
+         |
+         '--- CMP generate.sh
+              reads ConfigMap via K8s API
+              reads values-dynamic.yaml from chart directory
+              builds --set-string flags
+              renders chart with helm template
+```
+
+The upstream chart is never modified. The mapping file lives in Git alongside the chart.
+
+## How It Works
+
+Each chart that needs dynamic values has three files:
+
+**Chart.yaml** — CMP annotation + upstream dependency:
 ```yaml
-# This ALWAYS returns empty in ArgoCD's default rendering:
-{{- $config := (lookup "v1" "ConfigMap" "kube-system" "my-config") }}
-# $config = map[] (empty)
-```
-
-## The Solution
-
-Use a **Config Management Plugin (CMP)** sidecar on the ArgoCD repo-server that renders charts with `helm template --dry-run=server`, which connects to the Kubernetes API and makes `lookup()` work.
-
-### Architecture
-
-```
-ArgoCD repo-server Pod
-├── repo-server (main container)     # Default: offline helm template
-└── cmp-helm-lookup (sidecar)        # CMP: helm template --dry-run=server
-        │
-        ├── Reads ServiceAccount token
-        ├── Builds kubeconfig pointing to kubernetes.default.svc
-        └── Runs: helm template <app> . -n <ns> --dry-run=server --include-crds
-```
-
-The CMP sidecar:
-1. **Discovers** charts that opt in via a `Chart.yaml` annotation
-2. **Builds** a kubeconfig from the pod's mounted ServiceAccount token
-3. **Renders** templates with `--dry-run=server`, enabling API access for `lookup()`
-
-### How CMP Plugin Discovery Works
-
-ArgoCD CMP uses a **discover** mechanism to decide which plugin handles a given chart. Our plugin checks for a specific annotation in `Chart.yaml`:
-
-```yaml
-# The plugin runs this command to check if it should handle the chart:
-discover:
-  find:
-    command: [sh, -c, "grep -q 'cmp-lookup.*enabled' Chart.yaml && echo found"]
-```
-
-Only charts that include this annotation in their `Chart.yaml` are rendered by the CMP plugin:
-
-```yaml
+apiVersion: v2
+name: metrics-server-wrapper
+version: 1.0.0
 annotations:
   argocd.argoproj.io/cmp-lookup: "enabled"
+dependencies:
+  - name: metrics-server
+    version: "3.13.0"
+    repository: https://kubernetes-sigs.github.io/metrics-server/
 ```
 
-All other charts continue to use ArgoCD's default offline rendering.
+**values.yaml** — static defaults (things that don't vary per cluster):
+```yaml
+metrics-server:
+  args:
+    - --kubelet-insecure-tls
+```
+
+**values-dynamic.yaml** — maps ConfigMap keys to chart value paths:
+```yaml
+# {key} placeholders are replaced with values from the cluster-metadata ConfigMap
+metrics-server.serviceAccount.annotations.eks\.amazonaws\.com/role-arn: "arn:aws:iam::{accountId}:role/metrics-server"
+metrics-server.replicas: "{replicas}"
+```
+
+At render time, the CMP script reads the ConfigMap (`accountId=123456789012`, `replicas=5`), substitutes the placeholders, and passes `--set-string metrics-server.serviceAccount.annotations...=arn:aws:iam::123456789012:role/metrics-server --set metrics-server.replicas=5` to `helm template`.
+
+## Configuration
+
+The CMP sidecar is configured via environment variables on the repo-server deployment:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CMP_CONFIGMAP_NAME` | `cluster-metadata` | Name of the ConfigMap to read |
+| `CMP_CONFIGMAP_NAMESPACE` | `kube-system` | Namespace of the ConfigMap |
+| `CMP_DYNAMIC_VALUES_FILE` | `values-dynamic.yaml` | Name of the mapping file in each chart directory |
 
 ## Installation
 
-### Prerequisites
-
-- ArgoCD installed (Helm-based deployment recommended)
-- `kubectl` access to the cluster
-- The repo-server must have `automountServiceAccountToken: true` (default in ArgoCD Helm chart)
-
-### Step 1: RBAC - Grant repo-server API read access
-
-The repo-server ServiceAccount needs permission to read resources via `lookup()`.
-
 ```bash
-kubectl apply -f manifests/cmp-rbac.yaml
+kubectl apply -f docs/cmp-installation/cmp-rbac.yaml
+kubectl apply -f docs/cmp-installation/cmp-plugin.yaml
+kubectl patch deployment argocd-repo-server -n argocd \
+  --patch-file docs/cmp-installation/repo-server-patch.yaml
+kubectl rollout status deployment/argocd-repo-server -n argocd
 ```
 
-<details>
-<summary>manifests/cmp-rbac.yaml</summary>
+## Demo
 
+The `docs/showcase/` directory contains two experiments:
+
+### Experiment 1: Helm lookup() (custom charts)
+
+**Path:** `docs/showcase/approach-1-lookup-old/`
+
+Shows that `lookup()` works with the CMP annotation and fails without it. See [lookup() vs mapping](#lookup-vs-mapping-analysis) for when each approach is appropriate.
+
+| Chart | CMP annotation | Result |
+|-------|---------------|--------|
+| `chart-with-cmp/` | Yes | `lookup()` reads ConfigMap, values injected |
+| `chart-without-cmp/` | No | `nil pointer` — no API access |
+
+### Experiment 2: Upstream chart injection (metrics-server)
+
+**cluster-metadata** — deploys the ConfigMap (in production, Terraform does this):
 ```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: argocd-repo-server-lookup
-rules:
-  - apiGroups: [""]
-    resources: [configmaps, secrets, services, namespaces]
-    verbs: [get, list]
-  - apiGroups: ["apps"]
-    resources: [deployments, statefulsets, daemonsets]
-    verbs: [get, list]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: argocd-repo-server-lookup
-subjects:
-  - kind: ServiceAccount
-    name: argo-cd-argocd-repo-server  # Adjust to match your ArgoCD installation
-    namespace: argocd                  # Adjust to match your ArgoCD namespace
-roleRef:
-  kind: ClusterRole
-  name: argocd-repo-server-lookup
-  apiGroup: rbac.authorization.k8s.io
-```
-
-</details>
-
-> **Note:** Adjust the ServiceAccount `name` and `namespace` to match your ArgoCD installation. Common patterns:
-> - Helm install named `argo-cd` in namespace `argocd`: SA is `argo-cd-argocd-repo-server`
-> - Helm install named `argocd` in namespace `argocd`: SA is `argocd-repo-server`
-
-### Step 2: CMP Plugin ConfigMap
-
-Deploy the plugin definition that tells ArgoCD how to render charts with lookup support.
-
-```bash
-kubectl apply -f manifests/cmp-plugin.yaml
-```
-
-<details>
-<summary>manifests/cmp-plugin.yaml</summary>
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cmp-plugin
-  namespace: argocd  # Adjust to match your ArgoCD namespace
-data:
-  plugin.yaml: |
-    apiVersion: argoproj.io/v1alpha1
-    kind: ConfigManagementPlugin
-    metadata:
-      name: helm-with-lookup
-    spec:
-      version: v1.0
-      discover:
-        find:
-          command: [sh, -c, "grep -q 'cmp-lookup.*enabled' Chart.yaml && echo found"]
-      init:
-        command: [sh, -c, "test -f Chart.lock && helm dependency build || true"]
-      generate:
-        command:
-          - sh
-          - -c
-          - |
-            CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-            TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-            export KUBECONFIG=/tmp/kube
-            cat > $KUBECONFIG << EOF
-            apiVersion: v1
-            kind: Config
-            clusters:
-            - cluster:
-                certificate-authority: $CA
-                server: https://kubernetes.default.svc
-              name: default
-            contexts:
-            - context: {cluster: default, namespace: $ARGOCD_APP_NAMESPACE, user: default}
-              name: default
-            current-context: default
-            users:
-            - name: default
-              user: {token: $TOKEN}
-            EOF
-            helm template $ARGOCD_APP_NAME . -n $ARGOCD_APP_NAMESPACE --dry-run=server --include-crds
-```
-
-</details>
-
-#### How the generate command works
-
-The `generate` section is the core of the plugin. Here's what each part does:
-
-1. **Read the ServiceAccount credentials** mounted into the pod:
-   ```bash
-   CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-   TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-   ```
-
-2. **Build a kubeconfig** that points to the in-cluster API server:
-   ```bash
-   export KUBECONFIG=/tmp/kube
-   cat > $KUBECONFIG << EOF
-   # ... kubeconfig pointing to https://kubernetes.default.svc
-   EOF
-   ```
-
-3. **Render with server-side dry-run**, which enables `lookup()`:
-   ```bash
-   helm template $ARGOCD_APP_NAME . -n $ARGOCD_APP_NAMESPACE --dry-run=server --include-crds
-   ```
-
-The `$ARGOCD_APP_NAME` and `$ARGOCD_APP_NAMESPACE` environment variables are automatically set by ArgoCD for each application.
-
-### Step 3: Add CMP sidecar to repo-server
-
-Patch the ArgoCD repo-server deployment to add the CMP sidecar container.
-
-```bash
-kubectl apply -f manifests/repo-server-patch.yaml
-```
-
-<details>
-<summary>manifests/repo-server-patch.yaml</summary>
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: argo-cd-argocd-repo-server  # Adjust to match your deployment name
-  namespace: argocd                  # Adjust to match your ArgoCD namespace
-spec:
-  template:
-    spec:
-      volumes:
-        - name: cmp-plugin
-          configMap:
-            name: cmp-plugin
-        - name: cmp-tmp
-          emptyDir: {}
-      containers:
-        - name: cmp-helm-lookup
-          command: [/var/run/argocd/argocd-cmp-server]
-          image: quay.io/argoproj/argocd:v2.12.1  # Match your ArgoCD version
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 999
-          volumeMounts:
-            - name: cmp-plugin
-              mountPath: /home/argocd/cmp-server/config/plugin.yaml
-              subPath: plugin.yaml
-            - name: var-files
-              mountPath: /var/run/argocd
-            - name: cmp-tmp
-              mountPath: /tmp
-            - name: plugins
-              mountPath: /home/argocd/cmp-server/plugins
-```
-
-</details>
-
-> **Important:** The sidecar image version should match your ArgoCD version. The `var-files` and `plugins` volumes already exist in the default ArgoCD repo-server deployment.
-
-#### If you manage ArgoCD with Helm values
-
-Instead of patching, add the sidecar directly to your ArgoCD Helm values:
-
-```yaml
-repoServer:
-  volumes:
-    - name: cmp-plugin
-      configMap:
-        name: cmp-plugin
-    - name: cmp-tmp
-      emptyDir: {}
-  extraContainers:
-    - name: cmp-helm-lookup
-      command: [/var/run/argocd/argocd-cmp-server]
-      image: quay.io/argoproj/argocd:v2.12.1  # Match your ArgoCD version
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 999
-      volumeMounts:
-        - name: cmp-plugin
-          mountPath: /home/argocd/cmp-server/config/plugin.yaml
-          subPath: plugin.yaml
-        - name: var-files
-          mountPath: /var/run/argocd
-        - name: cmp-tmp
-          mountPath: /tmp
-        - name: plugins
-          mountPath: /home/argocd/cmp-server/plugins
-```
-
-### Step 4: Create a metadata ConfigMap (optional)
-
-A useful pattern is to create a cluster-wide metadata ConfigMap that any chart can read via `lookup()`:
-
-```bash
-kubectl apply -f manifests/cluster-metadata.yaml
-```
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: aws-metadata
-  namespace: kube-system
 data:
   accountId: "123456789012"
   region: "eu-central-1"
+  clusterName: "payments-dev"
   vpcId: "vpc-0abc123def456"
-  clusterName: "my-cluster"
-  environment: "production"
+  environment: "dev"
+  replicas: "5"
 ```
 
-This gives every chart access to cluster context without hardcoding values or passing them through Helm overrides.
+**metrics-server** — upstream chart with dynamic value injection:
+- `replicas` set from ConfigMap (currently 5)
+- IRSA role ARN constructed from `accountId`
 
-## Demo: Using lookup() in a chart
+## Operations: Changing a Value in Production
 
-The `demo-chart/` directory contains a working example.
+Example: scaling metrics-server from 3 to 5 replicas.
 
-### Opt in to CMP rendering
+**Single action: update the `cluster-metadata` ConfigMap.**
 
-Add the annotation to `Chart.yaml`:
+1. **Update the Terraform variable** — change `replicas: "3"` to `replicas: "5"` in the cluster's tfvars
+2. **Terraform plan/apply** — updates the ConfigMap in the cluster
+3. **ArgoCD auto-syncs** — CMP re-reads the ConfigMap, generates `--set metrics-server.replicas=5`, detects OutOfSync
+4. **Deployment scales to 5** — ArgoCD applies the change
+
+**What you DON'T touch:**
+- The metrics-server Helm chart (upstream, never modified)
+- The `values-dynamic.yaml` (mapping doesn't change, still says `{replicas}`)
+- The CMP generate script (generic, never changes)
+- ArgoCD Applications (no reconfiguration needed)
+
+## How the CMP Interacts with ArgoCD Sync
+
+The CMP only participates in the **render** phase. It has no role in sync or apply.
+
+```
+1. REFRESH (render)
+   ArgoCD asks: "what should the cluster look like?"
+   → CMP runs generate.sh
+   → Reads the live ConfigMap from the cluster, reads values-dynamic.yaml
+   → Returns rendered manifests to ArgoCD
+
+2. COMPARE (diff)
+   ArgoCD compares rendered manifests vs live cluster state
+   → Desired: replicas=3, Live: replicas=5
+   → Result: OutOfSync
+
+3. SYNC (apply)
+   ArgoCD applies the diff to the cluster (standard kubectl apply)
+   → No CMP involvement
+```
+
+### Refresh types
+
+- **Refresh** — re-renders manifests via CMP (reads the live ConfigMap), compares against cluster state. This is all you need when a ConfigMap value changes.
+- **Hard Refresh** — same as above, but also re-fetches the Git repo and invalidates the Helm dependency cache. Only needed when the chart source in Git changed.
+
+### Timing dependency
+
+The CMP reads the **live ConfigMap in the cluster**, not Git. If the ConfigMap is managed by a separate ArgoCD Application (as in the demo), there's a timing dependency:
+
+1. Git push changes the `cluster-metadata` chart (e.g., `replicas: 3` → `replicas: 5`)
+2. ArgoCD syncs the `cluster-metadata` app → ConfigMap updated in the cluster
+3. ArgoCD refreshes the `metrics-server` app → CMP reads the **updated** ConfigMap → renders `replicas=5` → detects OutOfSync
+
+If step 3 happens before step 2 (e.g., both apps refresh simultaneously), the CMP reads the **old** ConfigMap and sees no diff. The next refresh cycle (default: 3 minutes) will pick up the change.
+
+In production, where Terraform manages the ConfigMap directly (not via ArgoCD), this timing issue doesn't exist — the ConfigMap is updated before ArgoCD ever refreshes.
+
+## lookup() vs Mapping: Analysis
+
+The CMP sidecar enables two approaches. This section honestly evaluates whether `lookup()` in chart templates is needed, or whether the mapping approach (`values-dynamic.yaml`) is sufficient for all cases.
+
+**Short answer: the mapping approach covers all production use cases. `lookup()` is a capability of the CMP but not a recommended pattern.**
+
+### What the mapping approach can do
+
+- Inject any scalar value from a ConfigMap into any Helm value path
+- Construct strings from multiple ConfigMap values (e.g., ARN from `{accountId}`)
+- Works with any chart — upstream or custom — without template modification
+- Fully reviewable (the mapping file is simple YAML in Git)
+- Testable offline (no cluster needed to see what `--set` flags will be generated)
+- Predictable (same ConfigMap → same output, always)
+
+### What the mapping approach cannot do
+
+There are four categories where `lookup()` offers something the mapping can't:
+
+#### 1. Conditional rendering based on cluster state
 
 ```yaml
-apiVersion: v2
-name: my-chart
-version: 1.0.0
-annotations:
-  argocd.argoproj.io/cmp-lookup: "enabled"  # This triggers the CMP plugin
+{{- if (lookup "apiextensions.k8s.io/v1" "CRD" "" "certificates.cert-manager.io") }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+...
+{{- end }}
 ```
 
-### Use lookup() in templates
+"Only create this resource if a CRD exists." The mapping approach can't do this — it injects values, not conditional logic.
+
+**However:** In a controlled platform (ArgoCD sync waves, app-of-apps), deployment ordering is guaranteed. You don't need to check if cert-manager is installed — you know it is because Phase 0 runs before Phase 1. If you need a feature toggle, a boolean in the ConfigMap (`istioEnabled: "true"`) combined with the chart's built-in feature flags is simpler and more predictable than a runtime CRD check.
+
+**Verdict: Not needed.** Deployment ordering + ConfigMap booleans replace this.
+
+#### 2. Reading from resources other than the configured ConfigMap
+
+`lookup()` can read any resource — Secrets, other ConfigMaps, Services. The mapping approach reads from one ConfigMap.
+
+**However:**
+- **Secrets** should go through External Secrets Operator (ESO), not Helm rendering. Reading secrets at template time means they end up in ArgoCD's rendered manifest cache, which is a security concern.
+- **Other ConfigMaps** can be consolidated into the single `cluster-metadata` ConfigMap. If the data exists in the cluster, Terraform can also put it in the metadata ConfigMap.
+- **Services/endpoints** are a runtime concern, not a deploy-time concern. A chart shouldn't depend on another service's ClusterIP at render time.
+
+**Verdict: Not needed.** Secrets → ESO. Metadata → consolidate into one ConfigMap.
+
+#### 3. Idempotent secret generation
 
 ```yaml
-{{- $aws := (lookup "v1" "ConfigMap" "kube-system" "aws-metadata") }}
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ .Chart.Name }}
-spec:
-  replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels:
-      app: {{ .Chart.Name }}
-  template:
-    metadata:
-      labels:
-        app: {{ .Chart.Name }}
-    spec:
-      containers:
-      - name: app
-        image: nginx:alpine
-        env:
-        - name: AWS_ACCOUNT_ID
-          value: {{ $aws.data.accountId | quote }}
-        - name: AWS_REGION
-          value: {{ $aws.data.region | quote }}
-        - name: CLUSTER_NAME
-          value: {{ $aws.data.clusterName | quote }}
-        - name: ENVIRONMENT
-          value: {{ $aws.data.environment | quote }}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace "grafana-admin") }}
+{{- if not $existing }}
+apiVersion: v1
+kind: Secret
+data:
+  password: {{ randAlphaNum 32 | b64enc }}
+{{- end }}
 ```
 
-### Deploy and verify
+"Generate a random password on first install, don't overwrite on upgrade." Some upstream charts (PostgreSQL, Grafana) use this pattern.
 
-```bash
-# After syncing in ArgoCD:
-kubectl exec -n demo deploy/cmp-demo -- env | grep -E 'AWS|CLUSTER|ENVIRONMENT'
-# AWS_ACCOUNT_ID=123456789012
-# AWS_REGION=eu-central-1
-# CLUSTER_NAME=my-cluster
-# ENVIRONMENT=production
-```
+**However:** In a platform where ESO manages secrets, this pattern is unnecessary. Passwords are stored in a secrets manager (AWS Secrets Manager, Vault) and synced to Kubernetes by ESO. Helm never generates passwords.
 
-## Verification
+**Verdict: Not needed if ESO is in place.** For open-source users without ESO, this is the one scenario where `lookup()` adds genuine value.
 
-After installation, verify the CMP sidecar is running:
-
-```bash
-# Check repo-server has the sidecar
-kubectl get pods -n argocd -l app.kubernetes.io/name=argocd-repo-server \
-  -o jsonpath='{.items[0].spec.containers[*].name}'
-# Expected: repo-server cmp-helm-lookup
-
-# Check RBAC
-kubectl get clusterrole argocd-repo-server-lookup
-kubectl get clusterrolebinding argocd-repo-server-lookup
-
-# Check plugin ConfigMap
-kubectl get configmap cmp-plugin -n argocd
-
-# Check metadata ConfigMap (if created)
-kubectl get configmap aws-metadata -n kube-system -o yaml
-```
-
-## How it works end-to-end
-
-```
-1. Developer adds annotation to Chart.yaml:
-   argocd.argoproj.io/cmp-lookup: "enabled"
-
-2. ArgoCD detects the chart needs rendering:
-   - Checks each CMP plugin's discover command
-   - helm-with-lookup: grep -q 'cmp-lookup.*enabled' Chart.yaml → found!
-
-3. CMP sidecar renders the chart:
-   - Builds kubeconfig from ServiceAccount token
-   - Runs: helm template <app> . -n <ns> --dry-run=server
-   - lookup() calls hit the real Kubernetes API
-   - ConfigMap values are injected into the rendered manifests
-
-4. ArgoCD applies the rendered manifests to the cluster
-```
-
-## Troubleshooting
-
-### lookup() returns empty
-
-- Verify the CMP sidecar is running (check pod containers)
-- Verify the `Chart.yaml` has the `argocd.argoproj.io/cmp-lookup: "enabled"` annotation
-- Check that the RBAC ClusterRole includes the resource type you're looking up
-- Check sidecar logs: `kubectl logs -n argocd <repo-server-pod> -c cmp-helm-lookup`
-
-### Permission denied errors in sidecar logs
-
-- The ClusterRoleBinding must reference the correct ServiceAccount name and namespace
-- Verify with: `kubectl auth can-i get configmaps -n kube-system --as=system:serviceaccount:argocd:argo-cd-argocd-repo-server`
-
-### Chart renders with default ArgoCD (not CMP)
-
-- The `discover` command must output something to stdout. Verify: `grep -q 'cmp-lookup.*enabled' Chart.yaml && echo found`
-- Ensure the CMP plugin ConfigMap is mounted correctly in the sidecar
-
-### YAML parse error when templating Helm values with conditionals
-
-If you manage ArgoCD via Helm and use `templatefile()` or similar to conditionally include the sidecar in your values, be careful with whitespace-trimming directives. For example, in Terraform's `templatefile`:
+#### 4. Multi-resource queries
 
 ```yaml
-# WRONG - tilde (~) strips newlines, collapsing YAML keys onto one line:
-repoServer:
-  replicas: 2
-%{~ if enable_cmp ~}
-  volumes:
-# Renders as: "replicas: 2  volumes:" → YAML parse error!
-
-# CORRECT - no tilde, preserves newlines:
-repoServer:
-  replicas: 2
-%{ if enable_cmp }
-  volumes:
-# Renders as: "replicas: 2\n\n  volumes:" → valid YAML
+{{- $nodes := (lookup "v1" "Node" "" "") }}
+{{- $nodeCount := len $nodes.items }}
+replicas: {{ min $nodeCount 3 }}
 ```
 
-## Security Considerations
+"Set replicas based on cluster size." This requires querying resources the mapping approach can't express.
 
-- The CMP sidecar runs with the repo-server's ServiceAccount, which gets **read-only** cluster access via the ClusterRole
-- Scope the ClusterRole to only the resource types your charts actually need
-- The `--dry-run=server` flag sends manifests to the API server for validation but does **not** persist them
-- Only charts that explicitly opt in via the annotation are rendered by the CMP plugin
+**However:** This is fragile — the replica count is baked in at render time and doesn't adapt if nodes are added later. An HPA (Horizontal Pod Autoscaler) is the correct solution for dynamic scaling. For static sizing, put the value in the ConfigMap.
 
-## Compatibility
+**Verdict: Not needed.** Use HPA for dynamic scaling, ConfigMap for static sizing.
 
-Tested with:
-- ArgoCD v2.12.x
-- Helm v3.x
-- Kubernetes 1.28+
+### Summary
 
-## License
+| Scenario | lookup() needed? | Alternative |
+|----------|-----------------|-------------|
+| Inject ConfigMap values into charts | No | Mapping approach (simpler, testable) |
+| Conditional rendering (CRD exists?) | No | Deployment ordering + feature flags in ConfigMap |
+| Read Secrets at render time | No (and risky) | ESO |
+| Read other ConfigMaps | No | Consolidate into cluster-metadata |
+| Idempotent secret generation | Only without ESO | ESO |
+| Dynamic cluster queries | No | HPA / ConfigMap |
 
-MIT
+### Recommendation
+
+**Use the mapping approach (`values-dynamic.yaml`) for everything.** It is simpler, reviewable, testable, and covers all production scenarios.
+
+The `lookup()` capability exists as a side effect of how the CMP works (`--dry-run=server`). It is demonstrated in approach-1 for completeness, but should not be the default pattern. If you find yourself reaching for `lookup()`, consider whether a ConfigMap value or ESO would solve the same problem more cleanly.
+
+## Security
+
+The generate script is hardened:
+
+- **No `eval`** — ConfigMap values parsed via `read`, never executed
+- **No `envsubst`** — prevents leaking system env vars
+- **Input validation** — rejects keys/values with shell metacharacters
+- **`--set-string`** — values treated as strings (numbers/booleans use `--set`)
+- **Read-only RBAC** — repo-server only has `get`/`list` permissions
+
+## Files
+
+```
+docs/
+├── cmp-installation/
+│   ├── cmp-rbac.yaml              # ClusterRole + ClusterRoleBinding
+│   ├── cmp-plugin.yaml            # Plugin ConfigMap reference
+│   ├── generate.sh                # Generate script (source of truth)
+│   └── repo-server-patch.yaml     # Sidecar deployment patch
+└── showcase/
+    ├── cluster-metadata/          # ConfigMap chart (Terraform equivalent)
+    ├── approach-1-lookup-old/       # lookup() demo (custom charts)
+    │   ├── chart-with-cmp/       #   CMP enabled — lookup() works
+    │   └── chart-without-cmp/    #   No CMP — lookup() fails
+    └── approach-2-upstream-new/
+        └── metrics-server/        # Upstream chart with values-dynamic.yaml
+```
+
+## Related
+
+- [ArgoCD CMP Docs](https://argo-cd.readthedocs.io/en/stable/operator-manual/config-management-plugins/)
+- [ArgoCD Issue #21745](https://github.com/argoproj/argo-cd/issues/21745) — Native `--dry-run=server` proposal

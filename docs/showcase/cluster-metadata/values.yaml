@@ -1,0 +1,9 @@
+# These values are injected by Terraform during cluster provisioning.
+# Each cluster gets its own values.
+metadata:
+  accountId: "123456789012"
+  region: "eu-central-1"
+  clusterName: "example_cluster"
+  vpcId: "vpc-0a12bc322f456"
+  environment: "dev"
+  replicas: "3"

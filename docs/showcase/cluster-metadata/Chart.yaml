@@ -1,0 +1,4 @@
+apiVersion: v2
+name: cluster-metadata
+description: Cluster-specific metadata ConfigMap — deployed by Terraform during provisioning
+version: 1.0.0

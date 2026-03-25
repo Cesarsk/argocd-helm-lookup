@@ -1,0 +1,52 @@
+# CMP Plugin ConfigMap
+#
+# Contains two files mounted into the CMP sidecar:
+#   plugin.yaml   - plugin definition (discovery, init, generate commands)
+#   generate.sh   - the generate script (source of truth is docs/cmp-installation/generate.sh)
+#
+# To deploy, create this ConfigMap from the source files:
+#   kubectl create configmap cmp-plugin -n argocd \
+#     --from-file=plugin.yaml=<plugin.yaml content> \
+#     --from-file=generate.sh=docs/cmp-installation/generate.sh
+#
+# The plugin.yaml below is a reference copy. In practice, the ConfigMap
+# is created from both files using the command above.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cmp-plugin
+  namespace: argocd
+data:
+  plugin.yaml: |
+    apiVersion: argoproj.io/v1alpha1
+    kind: ConfigManagementPlugin
+    metadata:
+      name: helm-with-lookup
+    spec:
+      version: v1.0
+
+      # Discovery: only charts with this annotation are routed to the CMP
+      discover:
+        find:
+          command: [sh, -c, "grep -q 'cmp-lookup.*enabled' Chart.yaml && echo found"]
+
+      # Init: add Helm repos from Chart.yaml dependencies and download them
+      init:
+        command:
+          - sh
+          - -c
+          - |
+            if [ -f Chart.yaml ] && grep -q 'dependencies:' Chart.yaml; then
+              grep 'repository:' Chart.yaml | awk '{print $2}' | sort -u | while read repo; do
+                name=$(echo "$repo" | sed 's|https://||;s|/.*||;s|\.|-|g')
+                helm repo add "$name" "$repo" 2>/dev/null || true
+              done
+              helm dependency update . 2>&1 || true
+            fi
+
+      # Generate: runs generate.sh which reads the cluster-metadata ConfigMap
+      # and renders the chart with dynamic values.
+      # ArgoCD sets ARGOCD_APP_NAME and ARGOCD_APP_NAMESPACE as env vars
+      # automatically — generate.sh reads them directly, no args needed.
+      generate:
+        command: ["/home/argocd/cmp-server/config/generate.sh"]

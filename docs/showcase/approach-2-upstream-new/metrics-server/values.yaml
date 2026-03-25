@@ -1,0 +1,6 @@
+# Static values — things that don't vary per cluster.
+# Cluster-specific values are injected by the CMP script via --set-string
+# using the mapping in cmp-values-mapping.yaml.
+metrics-server:
+  args:
+    - --kubelet-insecure-tls

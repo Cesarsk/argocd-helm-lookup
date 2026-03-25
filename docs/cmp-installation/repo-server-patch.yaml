@@ -1,0 +1,42 @@
+# Patch to add CMP sidecar to argocd-repo-server
+# Apply: kubectl patch deployment argocd-repo-server -n argocd --patch-file repo-server-patch.yaml
+spec:
+  template:
+    spec:
+      automountServiceAccountToken: true
+      volumes:
+        - name: cmp-plugin
+          configMap:
+            name: cmp-plugin
+            defaultMode: 0755   # generate.sh needs to be executable
+        - name: cmp-tmp
+          emptyDir: {}
+      containers:
+        - name: cmp-helm-lookup
+          image: quay.io/argoproj/argocd:v2.13.3
+          command: [/var/run/argocd/argocd-cmp-server]
+          env:
+            # Configure which ConfigMap the CMP reads for dynamic values.
+            # Change these to point to a different ConfigMap or namespace.
+            - name: CMP_CONFIGMAP_NAME
+              value: "cluster-metadata"
+            - name: CMP_CONFIGMAP_NAMESPACE
+              value: "kube-system"
+            # - name: CMP_DYNAMIC_VALUES_FILE
+            #   value: "values-dynamic.yaml"  # default, uncomment to override
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+          volumeMounts:
+            - name: cmp-plugin
+              mountPath: /home/argocd/cmp-server/config/plugin.yaml
+              subPath: plugin.yaml
+            - name: cmp-plugin
+              mountPath: /home/argocd/cmp-server/config/generate.sh
+              subPath: generate.sh
+            - name: var-files
+              mountPath: /var/run/argocd
+            - name: cmp-tmp
+              mountPath: /tmp
+            - name: plugins
+              mountPath: /home/argocd/cmp-server/plugins

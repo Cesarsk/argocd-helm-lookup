@@ -1,0 +1,10 @@
+apiVersion: v2
+name: metrics-server-wrapper
+description: Upstream metrics-server with CMP dynamic value injection
+version: 1.0.0
+annotations:
+  argocd.argoproj.io/cmp-lookup: "enabled"
+dependencies:
+  - name: metrics-server
+    version: "3.13.0"
+    repository: https://kubernetes-sigs.github.io/metrics-server/

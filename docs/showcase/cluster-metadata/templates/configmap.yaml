@@ -1,0 +1,15 @@
+{{- range $ns := list "kube-system" $.Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-metadata
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: terraform
+    app.kubernetes.io/name: cluster-metadata
+data:
+  {{- range $key, $value := $.Values.metadata }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- end }}

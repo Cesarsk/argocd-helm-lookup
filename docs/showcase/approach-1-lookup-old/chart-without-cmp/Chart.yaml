@@ -1,0 +1,4 @@
+apiVersion: v2
+name: aws-metadata-demo
+description: Demo chart using lookup() - WITHOUT CMP marker
+version: 0.1.0

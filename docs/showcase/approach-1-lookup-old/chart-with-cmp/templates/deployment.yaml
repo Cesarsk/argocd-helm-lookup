@@ -1,10 +1,8 @@
-{{- $aws := (lookup "v1" "ConfigMap" "kube-system" "aws-metadata") }}
+{{- $aws := (lookup "v1" "ConfigMap" .Release.Namespace "aws-cluster-metadata") }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Chart.Name }}
-  labels:
-    {{- include "cmp-demo.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
@@ -27,5 +25,3 @@ spec:
           value: {{ $aws.data.vpcId | quote }}
         - name: CLUSTER_NAME
           value: {{ $aws.data.clusterName | quote }}
-        - name: ENVIRONMENT
-          value: {{ $aws.data.environment | quote }}
