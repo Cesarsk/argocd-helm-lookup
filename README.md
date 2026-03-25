@@ -1,3 +1,5 @@
+Medium article: https://lucacesarano.medium.com/a-small-and-easy-example-to-make-helm-lookup-work-in-argo-cd-92b18bd68593
+
 # ArgoCD CMP — Dynamic Value Injection
 
 A Config Management Plugin (CMP) that injects cluster-specific values into Helm charts at render time, removing the need to hardcode per-cluster values in chart configurations.
