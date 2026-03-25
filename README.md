@@ -68,20 +68,20 @@ The CMP sidecar is configured via environment variables on the repo-server deplo
 ## Installation
 
 ```bash
-kubectl apply -f docs/cmp-installation/cmp-rbac.yaml
-kubectl apply -f docs/cmp-installation/cmp-plugin.yaml
+kubectl apply -f cmp-installation/cmp-rbac.yaml
+kubectl apply -f cmp-installation/cmp-plugin.yaml
 kubectl patch deployment argocd-repo-server -n argocd \
-  --patch-file docs/cmp-installation/repo-server-patch.yaml
+  --patch-file cmp-installation/repo-server-patch.yaml
 kubectl rollout status deployment/argocd-repo-server -n argocd
 ```
 
 ## Demo
 
-The `docs/showcase/` directory contains two experiments:
+The `` directory contains two experiments:
 
 ### Experiment 1: Helm lookup() (custom charts)
 
-**Path:** `docs/showcase/approach-1-lookup-old/`
+**Path:** `approach-1-lookup-old/`
 
 Shows that `lookup()` works with the CMP annotation and fails without it. See [lookup() vs mapping](#lookup-vs-mapping-analysis) for when each approach is appropriate.
 
@@ -270,19 +270,17 @@ The generate script is hardened:
 ## Files
 
 ```
-docs/
-├── cmp-installation/
-│   ├── cmp-rbac.yaml              # ClusterRole + ClusterRoleBinding
-│   ├── cmp-plugin.yaml            # Plugin ConfigMap reference
-│   ├── generate.sh                # Generate script (source of truth)
-│   └── repo-server-patch.yaml     # Sidecar deployment patch
-└── showcase/
-    ├── cluster-metadata/          # ConfigMap chart (Terraform equivalent)
-    ├── approach-1-lookup-old/       # lookup() demo (custom charts)
-    │   ├── chart-with-cmp/       #   CMP enabled — lookup() works
-    │   └── chart-without-cmp/    #   No CMP — lookup() fails
-    └── approach-2-upstream-new/
-        └── metrics-server/        # Upstream chart with values-dynamic.yaml
+cmp-installation/
+├── cmp-rbac.yaml                  # ClusterRole + ClusterRoleBinding
+├── cmp-plugin.yaml                # Plugin ConfigMap reference
+├── generate.sh                    # Generate script (source of truth)
+└── repo-server-patch.yaml         # Sidecar deployment patch
+cluster-metadata/                  # ConfigMap chart (Terraform equivalent)
+approach-1-lookup-old/             # lookup() demo (custom charts)
+├── chart-with-cmp/                #   CMP enabled — lookup() works
+└── chart-without-cmp/             #   No CMP — lookup() fails
+approach-2-upstream-new/
+└── metrics-server/                # Upstream chart with values-dynamic.yaml
 ```
 
 ## Related
